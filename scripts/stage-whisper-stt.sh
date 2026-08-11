@@ -76,23 +76,63 @@ if compgen -G "${DEST}/whisper-stt-server*" > /dev/null; then
   exit 0
 fi
 
+[ -n "${GITHUB_SHA:-}" ] || {
+  echo "FATAL: GITHUB_SHA is required to fetch the whisper-stt artifact for this build commit." >&2
+  exit 1
+}
+
 TMP="$(mktemp -d)"
 trap 'rm -rf "${TMP}"' EXIT
 
-echo "Fetching ${ARTIFACT} from the latest successful build-whisper-stt run..."
-# No run id: gh resolves the most recent run that published this artifact.
-# Artifacts expire (retention-days in build-whisper-stt.yml), so a stale branch
-# can legitimately find nothing — say so in terms someone can act on.
-if ! gh run download --repo "${REPO}" --name "${ARTIFACT}" --dir "${TMP}" 2>"${TMP}/err"; then
+echo "Finding a successful build-whisper-stt run for commit ${GITHUB_SHA}..."
+if ! RUNS="$(gh run list \
+  --repo "${REPO}" \
+  --workflow build-whisper-stt.yml \
+  --commit "${GITHUB_SHA}" \
+  --status success \
+  --limit 100 \
+  --json databaseId,headSha,conclusion \
+  --jq '.[] | [.databaseId, .headSha, .conclusion] | @tsv' \
+  2>"${TMP}/err")"; then
+  cat "${TMP}/err" >&2
+  echo "FATAL: could not list build-whisper-stt runs for commit ${GITHUB_SHA}." >&2
+  exit 1
+fi
+
+RUN_ID=""
+while IFS=$'\t' read -r candidate_id candidate_sha candidate_conclusion; do
+  case "${candidate_id}" in ''|*[!0-9]*) continue ;; esac
+  if [ "${candidate_sha}" = "${GITHUB_SHA}" ] && [ "${candidate_conclusion}" = "success" ]; then
+    RUN_ID="${candidate_id}"
+    break
+  fi
+done < <(printf '%s\n' "${RUNS}")
+
+if [ -z "${RUN_ID}" ]; then
+  cat >&2 <<EOF
+FATAL: no successful build-whisper-stt run has head SHA ${GITHUB_SHA}.
+
+Re-run the workflow for this exact commit, then re-run this build:
+
+  gh workflow run build-whisper-stt.yml --repo ${REPO} --ref ${GITHUB_REF_NAME:-BRANCH_OR_TAG}
+EOF
+  exit 1
+fi
+
+echo "Fetching ${ARTIFACT} from build-whisper-stt run ${RUN_ID} for commit ${GITHUB_SHA}..."
+# Artifacts expire (retention-days in build-whisper-stt.yml), so an exact run
+# can legitimately have no downloadable artifact — say so in terms someone can
+# act on rather than falling back to an artifact from another commit.
+if ! gh run download "${RUN_ID}" --repo "${REPO}" --name "${ARTIFACT}" --dir "${TMP}" 2>"${TMP}/err"; then
   cat "${TMP}/err" >&2
   cat >&2 <<EOF
 
-FATAL: could not fetch ${ARTIFACT}.
+FATAL: could not fetch ${ARTIFACT} from run ${RUN_ID} for commit ${GITHUB_SHA}.
 
 The binaries come from the "Build whisper-stt binaries" workflow, and its
-artifacts expire. Re-run it against this branch, then re-run this build:
+artifacts expire. Re-run it for this exact commit, then re-run this build:
 
-  gh workflow run build-whisper-stt.yml --repo ${REPO}
+  gh workflow run build-whisper-stt.yml --repo ${REPO} --ref ${GITHUB_REF_NAME:-BRANCH_OR_TAG}
 
 Refusing to package: the installer would ship with speech-to-text silently
 dead (no transcription, no captions).

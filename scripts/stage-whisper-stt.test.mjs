@@ -3,12 +3,14 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import { afterEach, describe, it } from "vitest";
 
-const script = path.join(
-	path.dirname(fileURLToPath(import.meta.url)),
-	"stage-whisper-stt.sh",
+const scriptsDirectory = path.dirname(fileURLToPath(import.meta.url));
+const script = path.join(scriptsDirectory, "stage-whisper-stt.sh");
+const buildWorkflow = fs.readFileSync(
+	path.join(scriptsDirectory, "../.github/workflows/build.yml"),
+	"utf8",
 );
 const temporaryDirectories = [];
 
@@ -102,6 +104,13 @@ function runStage({ sha, runs = "", prebuilt = false } = {}) {
 }
 
 describe("stage-whisper-stt artifact provenance", () => {
+	it("grants the release workflow permission to read Actions artifacts", () => {
+		const permissions = buildWorkflow.match(/^permissions:\n((?: {2}[^\n]+\n)+)/m)?.[1] ?? "";
+
+		assert.match(permissions, /^ {2}actions: read$/m);
+		assert.match(permissions, /^ {2}contents: write$/m);
+	});
+
 	it("keeps a local prebuilt binary without requiring GitHub metadata", () => {
 		const result = runStage({ prebuilt: true });
 
@@ -117,7 +126,10 @@ describe("stage-whisper-stt artifact provenance", () => {
 		});
 
 		assert.equal(result.status, 0, result.stderr);
-		assert.match(result.log, /run list --repo example\/openscreen --workflow build-whisper-stt\.yml/);
+		assert.match(
+			result.log,
+			/run list --repo example\/openscreen --workflow build-whisper-stt\.yml/,
+		);
 		assert.match(result.log, /--commit exact-sha --status success/);
 		const download = result.log.split("\n").find((line) => line.startsWith("run download"));
 		assert.match(

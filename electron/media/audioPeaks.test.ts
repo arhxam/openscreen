@@ -3,7 +3,15 @@ import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ffmpegCandidates, peakBlockCount, resolveFfmpeg } from "./audioPeaks";
+import {
+	audioPeakCacheKey,
+	ffmpegCandidates,
+	getAudioPeaks,
+	isValidPeakDuration,
+	peakBlockCount,
+	resolveFfmpeg,
+	restoreCachedAudioPeaks,
+} from "./audioPeaks";
 
 const ROOT = path.resolve(__dirname, "..", "..");
 
@@ -21,6 +29,64 @@ describe("peakBlockCount", () => {
 
 	it("never returns zero blocks for a sliver of audio", () => {
 		expect(peakBlockCount(0.001)).toBe(1);
+	});
+});
+
+describe("audio peak cache", () => {
+	const file = {
+		filePath: "/recordings/demo.mp4",
+		size: 1_234_567,
+		mtimeMs: 1_723_456_789_012,
+	};
+
+	it("includes the cache format version in the identity", () => {
+		expect(audioPeakCacheKey(file, 12.3456789012345, 2)).not.toBe(
+			audioPeakCacheKey(file, 12.3456789012345, 3),
+		);
+	});
+
+	it("distinguishes durations even when they produce the same block count", () => {
+		const firstDuration = 1.0001;
+		const secondDuration = 1.0002;
+		expect(peakBlockCount(firstDuration)).toBe(peakBlockCount(secondDuration));
+
+		expect(audioPeakCacheKey(file, firstDuration)).not.toBe(
+			audioPeakCacheKey(file, secondDuration),
+		);
+	});
+
+	it.each([
+		Number.NaN,
+		Number.POSITIVE_INFINITY,
+		Number.NEGATIVE_INFINITY,
+		0,
+		-1,
+	])("rejects an invalid duration (%s)", async (durationSec) => {
+		expect(isValidPeakDuration(durationSec)).toBe(false);
+		// Validation happens before ffmpeg resolution, stat, or decode: invalid
+		// media metadata remains an ordinary renderer-fallback signal.
+		await expect(getAudioPeaks("/file/need/not/exist", durationSec)).resolves.toBeNull();
+	});
+
+	it("restores a correctly sized peak buffer", () => {
+		const durationSec = 0.01;
+		const peaks = new Float32Array([-0.5, 0.5, -0.25, 0.25]);
+
+		const restored = restoreCachedAudioPeaks(Buffer.from(peaks.buffer), durationSec);
+
+		expect(restored).toEqual(peaks);
+	});
+
+	it.each([
+		["truncated", -1],
+		["extra", 1],
+	])("rejects a %s cached peak buffer", (_label, byteDelta) => {
+		const durationSec = 0.01;
+		const expectedBytes = peakBlockCount(durationSec) * 2 * Float32Array.BYTES_PER_ELEMENT;
+
+		expect(
+			restoreCachedAudioPeaks(Buffer.alloc(expectedBytes + byteDelta), durationSec),
+		).toBeNull();
 	});
 });
 

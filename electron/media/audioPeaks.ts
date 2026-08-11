@@ -45,6 +45,11 @@ const PCM_RATE = 16_000;
 const MAX_PEAK_BLOCKS = 24_000;
 const PEAK_BLOCKS_PER_SEC = 200;
 
+/** Bump when the bytes represented by a cache entry change. Old entries are
+ * deliberately left in place: a changed identity makes them unreachable and
+ * avoids turning startup into cache-maintenance work. */
+const AUDIO_PEAK_CACHE_VERSION = 2;
+
 /** A recording whose audio takes longer than this to decode is not a recording,
  *  it is a wedged ffmpeg. ~30x the worst measured case. */
 const DECODE_TIMEOUT_MS = 60_000;
@@ -150,6 +155,11 @@ export function resolveFfmpeg(here?: string): string | null {
 /** Number of min/max blocks for a clip of `durationSec`. */
 export function peakBlockCount(durationSec: number): number {
 	return Math.min(MAX_PEAK_BLOCKS, Math.max(1, Math.ceil(durationSec * PEAK_BLOCKS_PER_SEC)));
+}
+
+/** Only real clip durations can participate in decoding or cache identity. */
+export function isValidPeakDuration(durationSec: number): boolean {
+	return Number.isFinite(durationSec) && durationSec > 0;
 }
 
 /**
@@ -261,17 +271,59 @@ async function decodePeaks(
 	});
 }
 
+export interface AudioPeakCacheFileIdentity {
+	filePath: string;
+	size: number;
+	mtimeMs: number;
+}
+
 /**
- * Cache key: path plus size plus mtime. A recording is immutable in practice,
- * but keying on identity alone would serve stale peaks for a re-encoded or
- * replaced file, and that failure is silent and confusing.
+ * Cache key: cache format, file identity, and the exact IEEE-754 duration.
+ *
+ * Duration is part of the decoded output twice: it sets both the number of
+ * blocks and the samples folded into each block. Two durations can have the
+ * same block count but still produce different peaks, so hashing only the
+ * derived count is insufficient. Writing the double directly also avoids
+ * introducing a lossy decimal rounding policy here.
  */
-async function cacheKey(filePath: string): Promise<string> {
-	const info = await stat(filePath);
+export function audioPeakCacheKey(
+	file: AudioPeakCacheFileIdentity,
+	durationSec: number,
+	cacheVersion: number = AUDIO_PEAK_CACHE_VERSION,
+): string {
+	if (!isValidPeakDuration(durationSec)) {
+		throw new RangeError("Audio peak cache duration must be finite and positive");
+	}
+	const durationBytes = Buffer.allocUnsafe(Float64Array.BYTES_PER_ELEMENT);
+	durationBytes.writeDoubleBE(durationSec);
 	return createHash("sha1")
-		.update(`${filePath}:${info.size}:${info.mtimeMs}`)
+		.update(`audio-peaks-v${cacheVersion}\0`)
+		.update(JSON.stringify([file.filePath, file.size, file.mtimeMs]))
+		.update("\0")
+		.update(durationBytes)
 		.digest("hex")
 		.slice(0, 32);
+}
+
+async function cacheKey(filePath: string, durationSec: number): Promise<string> {
+	const info = await stat(filePath);
+	return audioPeakCacheKey({ filePath, size: info.size, mtimeMs: info.mtimeMs }, durationSec);
+}
+
+/** Restore a cache entry only when it has exactly the shape this duration
+ * requires. A short or oversized write is a cache miss, never a partial
+ * waveform. The copy also handles Buffers whose backing storage is unaligned. */
+export function restoreCachedAudioPeaks(
+	cached: Uint8Array,
+	durationSec: number,
+): Float32Array | null {
+	if (!isValidPeakDuration(durationSec)) return null;
+	const expectedByteLength = peakBlockCount(durationSec) * 2 * Float32Array.BYTES_PER_ELEMENT;
+	if (cached.byteLength !== expectedByteLength) return null;
+
+	const bytes = new Uint8Array(expectedByteLength);
+	bytes.set(cached);
+	return new Float32Array(bytes.buffer);
 }
 
 /** Null outside Electron (tests, any headless use): decoding still works, it
@@ -298,19 +350,17 @@ export async function getAudioPeaks(
 	filePath: string,
 	durationSec: number,
 ): Promise<Float32Array | null> {
+	if (!isValidPeakDuration(durationSec)) return null;
 	const ffmpeg = resolveFfmpeg();
-	if (!ffmpeg || !durationSec || durationSec <= 0) return null;
+	if (!ffmpeg) return null;
 
 	const dir = cacheDir();
-	const cachePath = dir ? path.join(dir, `${await cacheKey(filePath)}.f32`) : null;
+	const cachePath = dir ? path.join(dir, `${await cacheKey(filePath, durationSec)}.f32`) : null;
 	if (cachePath) {
 		try {
 			const cached = await readFile(cachePath);
-			// A Buffer's memory may not be 4-byte aligned and its byteOffset is
-			// almost never 0 — copy rather than viewing it in place.
-			return new Float32Array(
-				cached.buffer.slice(cached.byteOffset, cached.byteOffset + cached.byteLength),
-			);
+			const restored = restoreCachedAudioPeaks(cached, durationSec);
+			if (restored) return restored;
 		} catch {
 			// Not cached yet.
 		}

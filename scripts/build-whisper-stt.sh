@@ -57,6 +57,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# workflow_dispatch choice inputs arrive as the strings "true" and "false",
+# while local callers historically use CMake-style ON/OFF. Normalize both at
+# the boundary so a requested CUDA build cannot be silently skipped.
+case "${CUDA_ENABLED}" in
+  ON|on|TRUE|True|true|1) CUDA_ENABLED=ON ;;
+  OFF|off|FALSE|False|false|0|"") CUDA_ENABLED=OFF ;;
+  *)
+    echo "Invalid ENABLE_CUDA value: ${CUDA_ENABLED}" >&2
+    echo "Expected one of: true, false, ON, OFF, 1, 0." >&2
+    exit 2
+    ;;
+esac
+
 os_arch_tag() {
   local os_arch
   case "$(uname -s):$(uname -m)" in

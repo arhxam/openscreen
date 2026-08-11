@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -20,7 +20,7 @@ function executable(directory, name, source) {
 	return executablePath;
 }
 
-function configureArguments({ system, machine }) {
+function runBuild({ system, machine, enableCuda = "OFF", provideNvcc = false, args = [] }) {
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "openscreen-whisper-build-"));
 	temporaryDirectories.push(root);
 	const scriptDirectory = path.join(root, "scripts");
@@ -81,13 +81,17 @@ else
 fi
 `,
 	);
+	if (provideNvcc) {
+		executable(fakeBin, "nvcc", "#!/usr/bin/env bash\nexit 0\n");
+	}
 
-	execFileSync("bash", [path.join(scriptDirectory, "build-whisper-stt.sh")], {
+	const result = spawnSync("bash", [path.join(scriptDirectory, "build-whisper-stt.sh"), ...args], {
 		cwd: root,
+		encoding: "utf8",
 		env: {
 			...process.env,
 			CMAKE_CAPTURE_LOG: logPath,
-			ENABLE_CUDA: "OFF",
+			ENABLE_CUDA: enableCuda,
 			FAKE_UNAME_MACHINE: machine,
 			FAKE_UNAME_SYSTEM: system,
 			PATH: `${fakeBin}:${process.env.PATH}`,
@@ -96,25 +100,80 @@ fi
 		stdio: "pipe",
 	});
 
-	const configureCall = fs.readFileSync(logPath, "utf8").split("CALL\n").filter(Boolean)[0];
-	return configureCall
-		.split("\n")
-		.filter((line) => line.startsWith("ARG="))
-		.map((line) => line.slice("ARG=".length));
+	const calls = fs.existsSync(logPath)
+		? fs
+				.readFileSync(logPath, "utf8")
+				.split("CALL\n")
+				.filter(Boolean)
+				.map((call) =>
+					call
+						.split("\n")
+						.filter((line) => line.startsWith("ARG="))
+						.map((line) => line.slice("ARG=".length)),
+				)
+		: [];
+	return { ...result, configureCalls: calls.filter((call) => call[0] === "-S") };
 }
 
 describe("whisper-stt CMake generator selection", () => {
 	it("selects Visual Studio 2022 x64 explicitly on Windows", () => {
-		const args = configureArguments({ system: "MINGW64_NT-10.0", machine: "x86_64" });
+		const { configureCalls, status } = runBuild({
+			system: "MINGW64_NT-10.0",
+			machine: "x86_64",
+		});
+		expect(status).toBe(0);
+		const [args] = configureCalls;
 		expect(args).toEqual(expect.arrayContaining(["-G", "Visual Studio 17 2022", "-A", "x64"]));
 	});
 
 	it("leaves generator selection unchanged on Unix", () => {
-		const args = configureArguments({ system: "Darwin", machine: "x86_64" });
+		const { configureCalls, status } = runBuild({ system: "Darwin", machine: "x86_64" });
+		expect(status).toBe(0);
+		const [args] = configureCalls;
 		expect(args).not.toContain("-G");
 		expect(args).not.toContain("-A");
 		expect(args).not.toContain("Visual Studio 17 2022");
 		expect(args).not.toContain("x64");
+	});
+
+	it("builds both Windows variants when the workflow supplies ENABLE_CUDA=true", () => {
+		const { configureCalls, status } = runBuild({
+			system: "MINGW64_NT-10.0",
+			machine: "x86_64",
+			enableCuda: "true",
+			provideNvcc: true,
+		});
+		expect(status).toBe(0);
+		expect(configureCalls).toHaveLength(2);
+		expect(configureCalls[0]).not.toContain("-DOSC_ENABLE_CUDA=ON");
+		expect(configureCalls[1]).toContain("-DOSC_ENABLE_CUDA=ON");
+		for (const args of configureCalls) {
+			expect(args).toEqual(expect.arrayContaining(["-G", "Visual Studio 17 2022", "-A", "x64"]));
+		}
+	});
+
+	it("keeps --cuda as an override for a false environment value", () => {
+		const { configureCalls, status } = runBuild({
+			system: "MINGW64_NT-10.0",
+			machine: "x86_64",
+			enableCuda: "false",
+			provideNvcc: true,
+			args: ["--cuda"],
+		});
+		expect(status).toBe(0);
+		expect(configureCalls).toHaveLength(2);
+		expect(configureCalls[1]).toContain("-DOSC_ENABLE_CUDA=ON");
+	});
+
+	it("rejects invalid ENABLE_CUDA values", () => {
+		const { configureCalls, status, stderr } = runBuild({
+			system: "MINGW64_NT-10.0",
+			machine: "x86_64",
+			enableCuda: "sometimes",
+		});
+		expect(status).toBe(2);
+		expect(stderr).toContain("Invalid ENABLE_CUDA value: sometimes");
+		expect(configureCalls).toHaveLength(0);
 	});
 });
 

@@ -709,6 +709,14 @@ jobs:
             exit 1
           fi
 
+          # A manual dispatch runs from a branch commit, so a historical tag can
+          # still have the same package version while naming different source.
+          # Publishing that run would build GITHUB_SHA and then `--clobber` the
+          # assets attached to the older commit. Peel annotated tags and require
+          # the selected tag to name the exact source commit before downloading
+          # any artifacts.
+          node .github/scripts/verify-release-target.mjs "$TAG" "$GITHUB_SHA"
+
           if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(rc|beta|alpha)\.[0-9]+$ ]]; then
             PRERELEASE_FLAG="--prerelease"
             IS_PRERELEASE="true"

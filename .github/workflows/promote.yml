@@ -69,6 +69,7 @@ jobs:
         run: node .github/scripts/release-milestone-close.mjs
 
       - name: Bump the version to stable on the release branch
+        id: bump
         env:
           TOKEN: ${{ secrets.OPENSCREEN_RELEASE_TOKEN }}
           RC_TAG: ${{ steps.version.outputs.rc_tag }}
@@ -91,27 +92,36 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add package.json package-lock.json
-          git commit --allow-empty -m "chore(release): bump to ${STABLE_VERSION} [skip ci]" || true
-          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "$BRANCH"
+          git commit -m "chore(release): bump to ${STABLE_VERSION} [skip ci]"
+          BUMP_COMMIT=$(git rev-parse --verify "HEAD^{commit}")
+          if [[ ! "$BUMP_COMMIT" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Could not capture the stable version bump commit"
+            exit 1
+          fi
+          git push "https://x-access-token:${TOKEN}@github.com/${GITHUB_REPOSITORY}.git" \
+            "$BUMP_COMMIT:refs/heads/$BRANCH"
+          echo "commit=$BUMP_COMMIT" >> "$GITHUB_OUTPUT"
 
-      - name: Push stable tag on the release branch tip
+      - name: Push stable tag on the verified promotion commit
         env:
           # Use GITHUB_TOKEN for the tag push: a tag is a ref, not a file change, so
           # the workflows:write permission isn't needed.
           # Note: GITHUB_TOKEN tag pushes do NOT trigger build.yml in this org's setup,
           # so we explicitly trigger it via gh workflow run right after.
           STABLE_TAG: ${{ steps.version.outputs.stable_tag }}
-          STABLE_VERSION: ${{ steps.version.outputs.stable_version }}
+          BUMP_COMMIT: ${{ steps.bump.outputs.commit }}
         run: |
           set -euo pipefail
-          BRANCH="release/v${STABLE_VERSION}"
-          git fetch origin "$BRANCH"
-          git checkout "$BRANCH"
-          git reset --hard "origin/${BRANCH}"
+          if [[ -z "$BUMP_COMMIT" ]] || \
+             [[ ! "$BUMP_COMMIT" =~ ^[0-9a-f]{40}$ ]] || \
+             ! git rev-parse --verify "${BUMP_COMMIT}^{commit}" >/dev/null; then
+            echo "::error::The verified stable bump commit is missing or invalid: '${BUMP_COMMIT}'"
+            exit 1
+          fi
           # Delete remote tag first (idempotent on rerun) and any local tag.
           git push origin ":${STABLE_TAG}" 2>/dev/null || true
           git tag -d "$STABLE_TAG" 2>/dev/null || true
-          git tag "$STABLE_TAG"
+          git tag "$STABLE_TAG" "$BUMP_COMMIT"
           git push origin "$STABLE_TAG"
 
       # ORDER MATTERS. Everything that actually publishes the release runs before the

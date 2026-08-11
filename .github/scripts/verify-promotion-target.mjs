@@ -11,13 +11,30 @@ function git(cwd, args) {
 	}).trim();
 }
 
-function fetchRef({ cwd, remote, source, destination, description }) {
+function fetchPromotionRefs({
+	cwd,
+	remote,
+	rcTag,
+	releaseBranch,
+	tagRef,
+	branchRef,
+	fetchedTagRef,
+	fetchedBranchRef,
+	runGit,
+}) {
 	try {
-		git(cwd, ["fetch", "--force", "--no-tags", remote, `${source}:${destination}`]);
+		runGit(cwd, [
+			"fetch",
+			"--force",
+			"--no-tags",
+			remote,
+			`${tagRef}:${fetchedTagRef}`,
+			`${branchRef}:${fetchedBranchRef}`,
+		]);
 	} catch (error) {
 		const detail = error.stderr?.toString().trim();
 		throw new Error(
-			`Could not fetch ${description} from ${remote}. Confirm that the ref exists and is reachable.${detail ? ` Git said: ${detail}` : ""}`,
+			`Could not fetch RC tag ${rcTag} and release branch ${releaseBranch} from ${remote}. Confirm that both refs exist and are reachable.${detail ? ` Git said: ${detail}` : ""}`,
 		);
 	}
 }
@@ -34,6 +51,7 @@ export function verifyPromotionTarget({
 	remote = "origin",
 	rcTag,
 	releaseBranch,
+	runGit = git,
 }) {
 	if (!rcTag) throw new Error("an RC tag is required");
 	if (!releaseBranch) throw new Error("a release branch is required");
@@ -41,35 +59,32 @@ export function verifyPromotionTarget({
 	const tagRef = `refs/tags/${rcTag}`;
 	const branchRef = `refs/heads/${releaseBranch}`;
 	try {
-		git(cwd, ["check-ref-format", tagRef]);
+		runGit(cwd, ["check-ref-format", tagRef]);
 	} catch {
 		throw new Error(`invalid RC tag ref: ${rcTag}`);
 	}
 	try {
-		git(cwd, ["check-ref-format", branchRef]);
+		runGit(cwd, ["check-ref-format", branchRef]);
 	} catch {
 		throw new Error(`invalid release branch ref: ${releaseBranch}`);
 	}
 
 	const fetchedTagRef = "refs/openscreen-promotion/selected-rc";
 	const fetchedBranchRef = `refs/remotes/${remote}/${releaseBranch}`;
-	fetchRef({
+	fetchPromotionRefs({
 		cwd,
 		remote,
-		source: tagRef,
-		destination: fetchedTagRef,
-		description: `RC tag ${rcTag}`,
-	});
-	fetchRef({
-		cwd,
-		remote,
-		source: branchRef,
-		destination: fetchedBranchRef,
-		description: `release branch ${releaseBranch}`,
+		rcTag,
+		releaseBranch,
+		tagRef,
+		branchRef,
+		fetchedTagRef,
+		fetchedBranchRef,
+		runGit,
 	});
 
-	const tagCommit = git(cwd, ["rev-parse", "--verify", `${fetchedTagRef}^{commit}`]);
-	const branchCommit = git(cwd, ["rev-parse", "--verify", `${fetchedBranchRef}^{commit}`]);
+	const tagCommit = runGit(cwd, ["rev-parse", "--verify", `${fetchedTagRef}^{commit}`]);
+	const branchCommit = runGit(cwd, ["rev-parse", "--verify", `${fetchedBranchRef}^{commit}`]);
 	if (tagCommit !== branchCommit) {
 		throw new Error(
 			`Selected RC tag ${rcTag} (${tagCommit}) does not match ${releaseBranch} (${branchCommit}); refusing to promote untested code`,

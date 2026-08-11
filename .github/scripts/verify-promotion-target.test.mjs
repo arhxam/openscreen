@@ -148,4 +148,30 @@ describe("verifyPromotionTarget", () => {
 
 		expect(output).toMatch(/Verified v2\.0\.0-rc\.1 and release\/v2\.0\.0 at [0-9a-f]{40}/);
 	});
+
+	it("fetches the selected tag and release branch in one remote operation", () => {
+		const { checkout } = createFixture();
+		const commands = [];
+		const runGit = (cwd, args) => {
+			commands.push(args);
+			return execFileSync("git", args, {
+				cwd,
+				encoding: "utf8",
+				stdio: ["ignore", "pipe", "pipe"],
+			}).trim();
+		};
+
+		verifyPromotionTarget({
+			cwd: checkout,
+			remote: "origin",
+			rcTag: "v2.0.0-rc.1",
+			releaseBranch: "release/v2.0.0",
+			runGit,
+		});
+
+		const fetches = commands.filter(([command]) => command === "fetch");
+		expect(fetches).toHaveLength(1);
+		expect(fetches[0]).toContain("refs/tags/v2.0.0-rc.1:refs/openscreen-promotion/selected-rc");
+		expect(fetches[0]).toContain("refs/heads/release/v2.0.0:refs/remotes/origin/release/v2.0.0");
+	});
 });

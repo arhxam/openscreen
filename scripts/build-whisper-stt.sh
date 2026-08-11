@@ -77,6 +77,13 @@ os_arch_tag() {
 readonly OS_ARCH="$(os_arch_tag)"
 readonly OUT_DIR="${OUT_ROOT}/${OS_ARCH}"
 
+# Select Visual Studio explicitly on Windows so CMake can locate and initialize
+# MSVC itself. Unix hosts keep CMake's existing default-generator behavior.
+CMAKE_GENERATOR_ARGS=()
+if [[ "${OS_ARCH}" == win32-* ]]; then
+  CMAKE_GENERATOR_ARGS=(-G "Visual Studio 17 2022" -A x64)
+fi
+
 # Determine the default backend flag for this host.
 backend_flag_for_host() {
   case "${OS_ARCH}" in
@@ -159,6 +166,7 @@ build_variant() {
   # and to the normal quoted expansion otherwise, on both bash versions.
   cmake -S "${SRC_DIR}" -B "${build_dir}" \
     -DCMAKE_BUILD_TYPE=Release \
+    ${CMAKE_GENERATOR_ARGS[@]+"${CMAKE_GENERATOR_ARGS[@]}"} \
     ${extra_cmake_flags[@]+"${extra_cmake_flags[@]}"}
 
   echo "[whisper-stt] building ${variant_name}"

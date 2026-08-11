@@ -5,22 +5,107 @@
 
 import fs from "node:fs/promises";
 import path from "node:path";
+import {
+	type PackedProjectData,
+	type ProjectDocument,
+	parseProjectDocument,
+} from "./projectDocument";
+
+export type { PackedProjectData } from "./projectDocument";
 
 /** Writes one already-newline-terminated chunk of CLI output. */
 export type CliWriter = (text: string) => void;
-
-export interface PackedProjectData {
-	version?: number;
-	media?: { screenVideoPath?: string; webcamVideoPath?: string; cursorCaptureMode?: string };
-	videoPath?: string;
-	editor?: Record<string, unknown>;
-}
 
 const isFile = (candidate: string): Promise<boolean> =>
 	fs
 		.stat(candidate)
 		.then((stats) => stats.isFile())
 		.catch(() => false);
+
+interface ResolvedReference {
+	storedPath: string;
+	resolvedPath: string | null;
+	exists: boolean;
+}
+
+/** Applies the same moved-project sibling fallback used by the desktop loader. */
+async function resolveReference(
+	projectDir: string,
+	storedPath: string,
+): Promise<ResolvedReference> {
+	if (await isFile(storedPath)) {
+		return { storedPath, resolvedPath: storedPath, exists: true };
+	}
+	const sibling = path.join(projectDir, path.basename(storedPath));
+	if (await isFile(sibling)) {
+		return { storedPath, resolvedPath: sibling, exists: true };
+	}
+	return { storedPath, resolvedPath: null, exists: false };
+}
+
+async function readProject(projectPath: string): Promise<ProjectDocument> {
+	let raw: unknown;
+	try {
+		raw = JSON.parse(await fs.readFile(projectPath, "utf8"));
+	} catch (error) {
+		if (error instanceof SyntaxError) {
+			throw new Error(`Invalid project JSON: ${error.message}`);
+		}
+		throw error;
+	}
+	return parseProjectDocument(raw);
+}
+
+interface BundleCopier {
+	copy(sourcePath: string): Promise<string>;
+	copyCursorSidecar(sourcePath: string, bundledMediaPath: string): Promise<boolean>;
+	files(): string[];
+}
+
+function createBundleCopier(outDir: string): BundleCopier {
+	const copied: string[] = [];
+	const destinationSet = new Set<string>();
+	const sourceDestinations = new Map<string, string>();
+
+	const reserveDestination = (sourcePath: string): string => {
+		const ext = path.extname(sourcePath);
+		const stem = path.basename(sourcePath, ext);
+		let destination = path.join(outDir, `${stem}${ext}`);
+		for (let n = 1; destinationSet.has(destination); n++) {
+			destination = path.join(outDir, `${stem}-${n}${ext}`);
+		}
+		destinationSet.add(destination);
+		return destination;
+	};
+
+	return {
+		async copy(sourcePath) {
+			const sourceKey = path.resolve(sourcePath);
+			const existing = sourceDestinations.get(sourceKey);
+			if (existing) return existing;
+			const destination = reserveDestination(sourcePath);
+			if (sourceKey !== path.resolve(destination)) {
+				await fs.copyFile(sourcePath, destination);
+			}
+			sourceDestinations.set(sourceKey, destination);
+			copied.push(destination);
+			return destination;
+		},
+		async copyCursorSidecar(sourcePath, bundledMediaPath) {
+			const sidecar = `${sourcePath}.cursor.json`;
+			if (!(await isFile(sidecar))) return false;
+			const destination = `${bundledMediaPath}.cursor.json`;
+			if (destinationSet.has(destination)) return false;
+			destinationSet.add(destination);
+			if (path.resolve(sidecar) !== path.resolve(destination)) {
+				await fs.copyFile(sidecar, destination);
+			}
+			copied.push(destination);
+			return true;
+		},
+		files: () => [...copied],
+	};
+}
 
 /** Copies a project and everything it references into one portable folder. */
 export async function runPackCommand(
@@ -32,69 +117,90 @@ export async function runPackCommand(
 	const emit = (message: string) => {
 		if (!json) out(`${message}\n`);
 	};
-
-	const raw = await fs.readFile(projectPath, "utf8");
-	const data = JSON.parse(raw) as PackedProjectData;
-	const media = data.media ?? (data.videoPath ? { screenVideoPath: data.videoPath } : undefined);
-	const screenVideoPath = media?.screenVideoPath;
-	if (!screenVideoPath) {
-		throw new Error("Project file does not reference a screen video");
-	}
-
+	const loaded = await readProject(projectPath);
 	const projectDir = path.dirname(path.resolve(projectPath));
-	const resolveSource = async (mediaPath: string): Promise<string> => {
-		if (await isFile(mediaPath)) return mediaPath;
-		// Moved project: the stored absolute path is stale but the media travelled
-		// with the .openscreen file. Same rule as the loader's sibling fallback.
-		const sibling = path.join(projectDir, path.basename(mediaPath));
-		if (await isFile(sibling)) return sibling;
-		throw new Error(`Referenced media not found: ${mediaPath}`);
-	};
-
 	await fs.mkdir(outDir, { recursive: true });
+	const copier = createBundleCopier(outDir);
+	let cursorSidecars = 0;
+	let assetCount = 1;
+	let droppedDerivedPaths = 0;
+	let packedProject: PackedProjectData | ProjectDocument["document"];
 
-	const copied: string[] = [];
-	const copyIn = async (sourcePath: string): Promise<string> => {
-		const ext = path.extname(sourcePath);
-		const stem = path.basename(sourcePath, ext);
-		let destination = path.join(outDir, stem + ext);
-		// Screen and webcam can share a basename across directories; don't overwrite.
-		for (let n = 1; copied.includes(destination); n++) {
-			destination = path.join(outDir, `${stem}-${n}${ext}`);
+	if (loaded.kind === "legacy") {
+		const data = loaded.document;
+		const media = data.media ?? (data.videoPath ? { screenVideoPath: data.videoPath } : undefined);
+		const screenVideoPath = media?.screenVideoPath;
+		if (!screenVideoPath) {
+			throw new Error("Project file does not reference a screen video");
 		}
-		if (path.resolve(sourcePath) !== path.resolve(destination)) {
-			await fs.copyFile(sourcePath, destination);
+		const screenReference = await resolveReference(projectDir, screenVideoPath);
+		if (!screenReference.resolvedPath) {
+			throw new Error(`Referenced media not found: ${screenVideoPath}`);
 		}
-		copied.push(destination);
-		return destination;
-	};
+		const newScreenPath = await copier.copy(screenReference.resolvedPath);
 
-	const screenSource = await resolveSource(screenVideoPath);
-	const newScreenPath = await copyIn(screenSource);
+		let newWebcamPath: string | undefined;
+		if (media.webcamVideoPath) {
+			const webcamReference = await resolveReference(projectDir, media.webcamVideoPath);
+			if (!webcamReference.resolvedPath) {
+				throw new Error(`Referenced media not found: ${media.webcamVideoPath}`);
+			}
+			newWebcamPath = await copier.copy(webcamReference.resolvedPath);
+		}
+		if (await copier.copyCursorSidecar(screenReference.resolvedPath, newScreenPath)) {
+			cursorSidecars++;
+		}
 
-	let newWebcamPath: string | undefined;
-	if (media.webcamVideoPath) {
-		newWebcamPath = await copyIn(await resolveSource(media.webcamVideoPath));
+		packedProject = {
+			...data,
+			media: {
+				...media,
+				screenVideoPath: newScreenPath,
+				...(newWebcamPath ? { webcamVideoPath: newWebcamPath } : {}),
+			},
+		};
+		delete packedProject.videoPath;
+	} else {
+		assetCount = loaded.document.assets.length;
+		const assets = [];
+		for (const asset of loaded.document.assets) {
+			const originalReference = await resolveReference(projectDir, asset.originalPath);
+			if (!originalReference.resolvedPath) {
+				throw new Error(`Referenced media not found: ${asset.originalPath}`);
+			}
+			const bundledOriginal = await copier.copy(originalReference.resolvedPath);
+			if (await copier.copyCursorSidecar(originalReference.resolvedPath, bundledOriginal)) {
+				cursorSidecars++;
+			}
+
+			let cameraTrack = asset.cameraTrack;
+			if (cameraTrack) {
+				const cameraReference = await resolveReference(projectDir, cameraTrack.sourcePath);
+				if (!cameraReference.resolvedPath) {
+					throw new Error(`Referenced media not found: ${cameraTrack.sourcePath}`);
+				}
+				cameraTrack = {
+					...cameraTrack,
+					sourcePath: await copier.copy(cameraReference.resolvedPath),
+				};
+			}
+
+			const { proxyPath, waveformPath, ...portableAsset } = asset;
+			droppedDerivedPaths += Number(proxyPath !== undefined) + Number(waveformPath !== undefined);
+			assets.push({
+				...portableAsset,
+				originalPath: bundledOriginal,
+				cameraTrack,
+			});
+		}
+		// Proxy and waveform paths are derived caches, not required source media.
+		// Dropping them prevents a moved bundle from retaining machine-local cache paths.
+		packedProject = { ...loaded.document, assets };
 	}
 
-	// Cursor telemetry sidecar sits at "<video path>.cursor.json".
-	const cursorSidecar = `${screenSource}.cursor.json`;
-	const hasCursorData = await isFile(cursorSidecar);
-	if (hasCursorData) {
-		await copyIn(cursorSidecar);
-	}
-
-	const packedProject: PackedProjectData = {
-		...data,
-		media: {
-			...media,
-			screenVideoPath: newScreenPath,
-			...(newWebcamPath ? { webcamVideoPath: newWebcamPath } : {}),
-		},
-	};
-	delete packedProject.videoPath;
 	const packedProjectPath = path.join(outDir, path.basename(projectPath));
 	await fs.writeFile(packedProjectPath, JSON.stringify(packedProject, null, 2), "utf8");
+	const copied = copier.files();
 
 	if (json) {
 		out(
@@ -103,16 +209,18 @@ export async function runPackCommand(
 				success: true,
 				projectPath: packedProjectPath,
 				files: [packedProjectPath, ...copied],
-				cursorData: hasCursorData,
+				cursorData: cursorSidecars > 0,
+				cursorSidecars,
+				assetCount,
+				droppedDerivedPaths,
 			})}\n`,
 		);
 	} else {
 		emit(`Packed project → ${packedProjectPath}`);
-		for (const file of copied) {
-			emit(`  + ${path.basename(file)}`);
-		}
-		if (!hasCursorData) {
-			emit("  (no cursor telemetry sidecar found)");
+		for (const file of copied) emit(`  + ${path.basename(file)}`);
+		if (cursorSidecars === 0) emit("  (no cursor telemetry sidecar found)");
+		if (droppedDerivedPaths > 0) {
+			emit(`  (removed ${droppedDerivedPaths} derived proxy/waveform cache paths)`);
 		}
 		emit(
 			"The folder is self-contained: if the stored paths go stale after moving it, the loader falls back to files next to the project.",
@@ -121,30 +229,21 @@ export async function runPackCommand(
 	return 0;
 }
 
-/** Prints what a project references and whether its media is still reachable. */
-export async function runInfoCommand(
-	projectPath: string,
-	json: boolean,
-	out: CliWriter,
-): Promise<number> {
-	const raw = await fs.readFile(projectPath, "utf8");
-	const data = JSON.parse(raw) as PackedProjectData;
+async function legacyInfo(projectPath: string, data: PackedProjectData) {
 	const editor = data.editor ?? {};
 	const count = (key: string) =>
 		Array.isArray(editor[key]) ? (editor[key] as unknown[]).length : 0;
+	const projectDir = path.dirname(path.resolve(projectPath));
 	const screenVideoPath = data.media?.screenVideoPath ?? data.videoPath ?? null;
-	const mediaExists = screenVideoPath
-		? await fs
-				.access(screenVideoPath)
-				.then(() => true)
-				.catch(() => false)
-		: false;
-
-	const summary = {
+	const screenReference = screenVideoPath
+		? await resolveReference(projectDir, screenVideoPath)
+		: null;
+	return {
 		projectPath,
 		version: data.version ?? null,
 		screenVideoPath,
-		screenVideoExists: mediaExists,
+		screenVideoExists: screenReference?.exists ?? false,
+		resolvedScreenVideoPath: screenReference?.resolvedPath ?? null,
 		webcamVideoPath: data.media?.webcamVideoPath ?? null,
 		cursorCaptureMode: data.media?.cursorCaptureMode ?? null,
 		exportFormat: (editor.exportFormat as string) ?? null,
@@ -155,20 +254,102 @@ export async function runInfoCommand(
 		speedRegions: count("speedRegions"),
 		annotationRegions: count("annotationRegions"),
 	};
+}
+
+/** Prints what a project references and whether its media is still reachable. */
+export async function runInfoCommand(
+	projectPath: string,
+	json: boolean,
+	out: CliWriter,
+): Promise<number> {
+	const loaded = await readProject(projectPath);
+	if (loaded.kind === "legacy") {
+		const summary = await legacyInfo(projectPath, loaded.document);
+		if (json) {
+			out(`${JSON.stringify(summary)}\n`);
+		} else {
+			out(
+				[
+					`Project:  ${summary.projectPath} (version ${summary.version ?? "?"})`,
+					`Video:    ${summary.screenVideoPath ?? "(none)"}${summary.screenVideoExists ? "" : "  [MISSING]"}`,
+					`Webcam:   ${summary.webcamVideoPath ?? "(none)"}`,
+					`Cursor:   ${summary.cursorCaptureMode ?? "(unknown)"}`,
+					`Export:   ${summary.exportFormat ?? "?"} / ${summary.exportQuality ?? "?"} / ${summary.aspectRatio ?? "?"}`,
+					`Timeline: ${summary.zoomRegions} zooms, ${summary.trimRegions} trims, ${summary.speedRegions} speed regions, ${summary.annotationRegions} annotations`,
+				].join("\n") + "\n",
+			);
+		}
+		return summary.screenVideoPath && !summary.screenVideoExists ? 1 : 0;
+	}
+
+	const document = loaded.document;
+	const projectDir = path.dirname(path.resolve(projectPath));
+	const assets = await Promise.all(
+		document.assets.map(async (asset) => {
+			const original = await resolveReference(projectDir, asset.originalPath);
+			const camera = asset.cameraTrack
+				? await resolveReference(projectDir, asset.cameraTrack.sourcePath)
+				: null;
+			return {
+				id: asset.id,
+				label: asset.label,
+				originalPath: asset.originalPath,
+				resolvedOriginalPath: original.resolvedPath,
+				originalExists: original.exists,
+				cameraPath: asset.cameraTrack?.sourcePath ?? null,
+				resolvedCameraPath: camera?.resolvedPath ?? null,
+				cameraExists: camera?.exists ?? null,
+			};
+		}),
+	);
+	const primaryId = document.project.primaryAssetId ?? document.assets[0]?.id;
+	const primaryIndex = primaryId
+		? document.assets.findIndex((asset) => asset.id === primaryId)
+		: -1;
+	const primaryAsset = primaryIndex >= 0 ? document.assets[primaryIndex] : undefined;
+	const primaryStatus = primaryIndex >= 0 ? assets[primaryIndex] : undefined;
+	const legacyEditor = document.legacyEditor ?? {};
+	const summary = {
+		projectPath,
+		schemaVersion: document.schemaVersion,
+		projectTitle: document.project.title,
+		assetCount: document.assets.length,
+		clipCount: document.timeline.clips.length,
+		assets,
+		// Keep the established JSON fields populated for current projects where they map cleanly.
+		version: null,
+		screenVideoPath: primaryAsset?.originalPath ?? null,
+		screenVideoExists: primaryStatus?.originalExists ?? false,
+		webcamVideoPath: primaryAsset?.cameraTrack?.sourcePath ?? null,
+		cursorCaptureMode: null,
+		exportFormat: (legacyEditor.exportFormat as string) ?? null,
+		exportQuality: (legacyEditor.exportQuality as string) ?? null,
+		aspectRatio: (legacyEditor.aspectRatio as string) ?? null,
+		zoomRegions: document.zoomRanges.length,
+		trimRegions: document.timeline.trimRanges.length,
+		speedRegions: document.timeline.speedRanges.length,
+		annotationRegions: document.annotations.length,
+	};
 
 	if (json) {
 		out(`${JSON.stringify(summary)}\n`);
 	} else {
-		out(
-			[
-				`Project:  ${summary.projectPath} (version ${summary.version ?? "?"})`,
-				`Video:    ${summary.screenVideoPath ?? "(none)"}${mediaExists ? "" : "  [MISSING]"}`,
-				`Webcam:   ${summary.webcamVideoPath ?? "(none)"}`,
-				`Cursor:   ${summary.cursorCaptureMode ?? "(unknown)"}`,
-				`Export:   ${summary.exportFormat ?? "?"} / ${summary.exportQuality ?? "?"} / ${summary.aspectRatio ?? "?"}`,
-				`Timeline: ${summary.zoomRegions} zooms, ${summary.trimRegions} trims, ${summary.speedRegions} speed regions, ${summary.annotationRegions} annotations`,
-			].join("\n") + "\n",
+		const lines = [
+			`Project:  ${summary.projectPath} (${summary.projectTitle}, schema ${summary.schemaVersion})`,
+			`Assets:   ${summary.assetCount}`,
+		];
+		for (const asset of assets) {
+			lines.push(
+				`  ${asset.label}: ${asset.originalPath}${asset.originalExists ? "" : "  [MISSING]"}`,
+			);
+			if (asset.cameraPath) {
+				lines.push(`    Camera: ${asset.cameraPath}${asset.cameraExists ? "" : "  [MISSING]"}`);
+			}
+		}
+		lines.push(
+			`Timeline: ${summary.clipCount} clips, ${summary.zoomRegions} zooms, ${summary.trimRegions} trims, ${summary.speedRegions} speed regions, ${summary.annotationRegions} annotations`,
 		);
+		out(`${lines.join("\n")}\n`);
 	}
-	return summary.screenVideoPath && !mediaExists ? 1 : 0;
+	return assets.some((asset) => !asset.originalExists) ? 1 : 0;
 }

@@ -53,6 +53,15 @@ jobs:
           echo "stable_tag=$STABLE_TAG"       >> "$GITHUB_OUTPUT"
           echo "Promoting ${TAG} -> ${STABLE_TAG}"
 
+      - name: Verify selected RC is the release branch tip
+        env:
+          RC_TAG: ${{ steps.version.outputs.rc_tag }}
+          STABLE_VERSION: ${{ steps.version.outputs.stable_version }}
+        run: |
+          set -euo pipefail
+          node .github/scripts/verify-promotion-target.mjs \
+            "$RC_TAG" "release/v${STABLE_VERSION}"
+
       - name: Close versioned milestone
         env:
           TOKEN: ${{ secrets.OPENSCREEN_RELEASE_TOKEN }}
@@ -62,14 +71,18 @@ jobs:
       - name: Bump the version to stable on the release branch
         env:
           TOKEN: ${{ secrets.OPENSCREEN_RELEASE_TOKEN }}
+          RC_TAG: ${{ steps.version.outputs.rc_tag }}
           STABLE_VERSION: ${{ steps.version.outputs.stable_version }}
         run: |
           set -euo pipefail
           # Promote checks out the FROZEN release branch (created by prerelease.yml) and
           # rewrites the version there. This guarantees the stable tag points at the
-          # same code that was tested as the RC plus any cherry-picked bugfixes.
+          # exact code tested as the selected RC. A bugfix requires a new RC tag.
           BRANCH="release/v${STABLE_VERSION}"
-          git fetch origin "$BRANCH"
+          # Fetch and compare again immediately before touching the branch. The
+          # milestone step can take long enough for the remote branch to move after
+          # the initial guard; reset only to the tracking ref this check just fetched.
+          node .github/scripts/verify-promotion-target.mjs "$RC_TAG" "$BRANCH"
           git checkout "$BRANCH"
           git reset --hard "origin/${BRANCH}"
           # Writes package-lock.json too. A sed over package.json alone left the
@@ -165,7 +178,7 @@ jobs:
             --base main \
             --head "${BRANCH}-sync" \
             --title "chore(release): release v${STABLE_VERSION} into main" \
-            --body "Sync main with the released snapshot (RC + cherry-picked bugfixes + version bump). Rebase-merged via PAT; bypass applies because EtienneLescot is a ruleset bypass actor." \
+            --body "Sync main with the released snapshot (selected RC + version bump). Rebase-merged via PAT; bypass applies because EtienneLescot is a ruleset bypass actor." \
             --repo "$GITHUB_REPOSITORY" || echo "(PR already exists — skipping)"
           PR_NUMBER=$(gh pr list --head "${BRANCH}-sync" --state open --json number -q '.[0].number' --repo "$GITHUB_REPOSITORY")
           if [[ -z "$PR_NUMBER" ]]; then

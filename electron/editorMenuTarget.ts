@@ -8,6 +8,7 @@ export interface EditorMenuWindow {
 	isDestroyed: () => boolean;
 	webContents: {
 		getURL: () => string;
+		isLoadingMainFrame: () => boolean;
 		send: (channel: string) => void;
 		once: (event: "did-finish-load", listener: () => void) => void;
 	};
@@ -19,6 +20,20 @@ function isLiveEditorWindow(window: EditorMenuWindow | null): window is EditorMe
 		!window.isDestroyed() &&
 		window.webContents.getURL().includes("windowType=editor")
 	);
+}
+
+function sendWhenReady(window: EditorMenuWindow, channel: EditorMenuChannel) {
+	if (window.isDestroyed()) return;
+
+	if (!window.webContents.isLoadingMainFrame()) {
+		window.webContents.send(channel);
+		return;
+	}
+
+	window.webContents.once("did-finish-load", () => {
+		if (window.isDestroyed()) return;
+		window.webContents.send(channel);
+	});
 }
 
 export function dispatchEditorMenuAction(
@@ -34,15 +49,12 @@ export function dispatchEditorMenuAction(
 			: null;
 
 	if (existingEditor) {
-		existingEditor.webContents.send(channel);
+		sendWhenReady(existingEditor, channel);
 		return;
 	}
 
 	const createdEditor = createEditorWindow();
-	if (!createdEditor || createdEditor.isDestroyed()) return;
+	if (!createdEditor) return;
 
-	createdEditor.webContents.once("did-finish-load", () => {
-		if (createdEditor.isDestroyed()) return;
-		createdEditor.webContents.send(channel);
-	});
+	sendWhenReady(createdEditor, channel);
 }

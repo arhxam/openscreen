@@ -6,9 +6,12 @@ type FakeWindow = EditorMenuWindow & {
 	send: ReturnType<typeof vi.fn>;
 };
 
-function createWindow(options: { editor?: boolean; destroyed?: boolean } = {}): FakeWindow {
+function createWindow(
+	options: { editor?: boolean; destroyed?: boolean; loading?: boolean } = {},
+): FakeWindow {
 	const send = vi.fn();
-	let didFinishLoad: (() => void) | undefined;
+	let loading = options.loading ?? false;
+	const didFinishLoadListeners: Array<() => void> = [];
 
 	return {
 		isDestroyed: () => options.destroyed ?? false,
@@ -17,13 +20,17 @@ function createWindow(options: { editor?: boolean; destroyed?: boolean } = {}): 
 				options.editor === false
 					? "file:///index.html?windowType=notes"
 					: "file:///index.html?windowType=editor",
+			isLoadingMainFrame: () => loading,
 			send,
 			once: (event, listener) => {
 				expect(event).toBe("did-finish-load");
-				didFinishLoad = listener;
+				didFinishLoadListeners.push(listener);
 			},
 		},
-		emitDidFinishLoad: () => didFinishLoad?.(),
+		emitDidFinishLoad: () => {
+			loading = false;
+			for (const listener of didFinishLoadListeners) listener();
+		},
 		send,
 	};
 }
@@ -55,11 +62,34 @@ describe("dispatchEditorMenuAction", () => {
 		expect(createEditor).not.toHaveBeenCalled();
 	});
 
+	it("waits for a focused editor's main frame before sending", () => {
+		const focused = createWindow({ loading: true });
+
+		dispatchEditorMenuAction("menu-save-project", focused, null, vi.fn());
+
+		expect(focused.send).not.toHaveBeenCalled();
+		focused.emitDidFinishLoad();
+		expect(focused.send).toHaveBeenCalledWith("menu-save-project");
+	});
+
+	it("waits for a loading main editor behind an auxiliary window without creating", () => {
+		const auxiliary = createWindow({ editor: false });
+		const main = createWindow({ loading: true });
+		const createEditor = vi.fn();
+
+		dispatchEditorMenuAction("menu-save-project-as", auxiliary, main, createEditor);
+
+		expect(main.send).not.toHaveBeenCalled();
+		expect(createEditor).not.toHaveBeenCalled();
+		main.emitDidFinishLoad();
+		expect(main.send).toHaveBeenCalledWith("menu-save-project-as");
+	});
+
 	it.each([
 		["destroyed", createWindow({ destroyed: true })],
 		["non-editor", createWindow({ editor: false })],
 	])("creates an editor when the main window is %s", (_label, main) => {
-		const created = createWindow();
+		const created = createWindow({ loading: true });
 		const createEditor = vi.fn(() => created);
 
 		dispatchEditorMenuAction("menu-new-project", null, main, createEditor);
@@ -71,7 +101,7 @@ describe("dispatchEditorMenuAction", () => {
 	});
 
 	it("creates an editor when no window exists", () => {
-		const created = createWindow();
+		const created = createWindow({ loading: true });
 		const createEditor = vi.fn(() => created);
 
 		dispatchEditorMenuAction("menu-load-project", null, null, createEditor);
@@ -82,7 +112,7 @@ describe("dispatchEditorMenuAction", () => {
 	});
 
 	it("keeps the created window as the async action target", () => {
-		const created = createWindow();
+		const created = createWindow({ loading: true });
 		const replacement = createWindow();
 		let currentWindow = created;
 
@@ -94,9 +124,25 @@ describe("dispatchEditorMenuAction", () => {
 		expect(replacement.send).not.toHaveBeenCalled();
 	});
 
+	it("delivers two rapid actions after a newly created editor finishes loading", () => {
+		const created = createWindow({ loading: true });
+		const createEditor = vi.fn(() => created);
+
+		dispatchEditorMenuAction("menu-load-project", null, null, createEditor);
+		dispatchEditorMenuAction("menu-save-project", null, created, createEditor);
+
+		expect(createEditor).toHaveBeenCalledOnce();
+		expect(created.send).not.toHaveBeenCalled();
+		created.emitDidFinishLoad();
+		expect(created.send.mock.calls).toEqual([
+			["menu-load-project"],
+			["menu-save-project"],
+		]);
+	});
+
 	it("does not send after a newly created target is destroyed", () => {
 		let destroyed = false;
-		const created = createWindow();
+		const created = createWindow({ loading: true });
 		created.isDestroyed = () => destroyed;
 
 		dispatchEditorMenuAction("menu-save-project", null, null, () => created);

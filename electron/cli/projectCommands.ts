@@ -58,50 +58,77 @@ async function readProject(projectPath: string): Promise<ProjectDocument> {
 
 interface BundleCopier {
 	copy(sourcePath: string): Promise<string>;
-	copyCursorSidecar(sourcePath: string, bundledMediaPath: string): Promise<boolean>;
+	copyOriginal(sourcePath: string): Promise<{ destination: string; cursorSidecarCopied: boolean }>;
 	files(): string[];
 }
 
-function createBundleCopier(outDir: string): BundleCopier {
+function portableDestinationKey(candidate: string): string {
+	// A bundle can be created on a case-sensitive filesystem and opened on a
+	// case-insensitive one. Reserve names using the stricter portable semantics.
+	return path.resolve(candidate).normalize("NFC").toLowerCase();
+}
+
+async function sourceIdentity(sourcePath: string): Promise<string> {
+	const realPath = await fs.realpath(sourcePath);
+	const normalized = realPath.normalize("NFC");
+	return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function createBundleCopier(outDir: string, reservedPaths: string[]): BundleCopier {
 	const copied: string[] = [];
-	const destinationSet = new Set<string>();
+	const destinationSet = new Set(reservedPaths.map(portableDestinationKey));
 	const sourceDestinations = new Map<string, string>();
 
-	const reserveDestination = (sourcePath: string): string => {
+	const reserveDestination = (
+		sourcePath: string,
+		includeCursorSidecar: boolean,
+	): { destination: string; cursorDestination: string | null } => {
 		const ext = path.extname(sourcePath);
 		const stem = path.basename(sourcePath, ext);
-		let destination = path.join(outDir, `${stem}${ext}`);
-		for (let n = 1; destinationSet.has(destination); n++) {
-			destination = path.join(outDir, `${stem}-${n}${ext}`);
+		for (let n = 0; ; n++) {
+			const destination = path.join(outDir, `${stem}${n === 0 ? "" : `-${n}`}${ext}`);
+			const cursorDestination = includeCursorSidecar ? `${destination}.cursor.json` : null;
+			if (
+				!destinationSet.has(portableDestinationKey(destination)) &&
+				(!cursorDestination || !destinationSet.has(portableDestinationKey(cursorDestination)))
+			) {
+				destinationSet.add(portableDestinationKey(destination));
+				if (cursorDestination) {
+					destinationSet.add(portableDestinationKey(cursorDestination));
+				}
+				return { destination, cursorDestination };
+			}
 		}
-		destinationSet.add(destination);
-		return destination;
+	};
+
+	const copyMedia = async (
+		sourcePath: string,
+		withCursorSidecar: boolean,
+	): Promise<{ destination: string; cursorSidecarCopied: boolean }> => {
+		const sourceKey = await sourceIdentity(sourcePath);
+		const existing = sourceDestinations.get(sourceKey);
+		if (existing) return { destination: existing, cursorSidecarCopied: false };
+		const cursorSource = `${sourcePath}.cursor.json`;
+		const hasCursorSidecar = withCursorSidecar && (await isFile(cursorSource));
+		const { destination, cursorDestination } = reserveDestination(sourcePath, hasCursorSidecar);
+		if (path.resolve(sourcePath) !== path.resolve(destination)) {
+			await fs.copyFile(sourcePath, destination);
+		}
+		if (cursorDestination) {
+			await fs.copyFile(cursorSource, cursorDestination);
+		}
+		sourceDestinations.set(sourceKey, destination);
+		copied.push(destination);
+		if (cursorDestination) copied.push(cursorDestination);
+		return { destination, cursorSidecarCopied: cursorDestination !== null };
 	};
 
 	return {
 		async copy(sourcePath) {
-			const sourceKey = path.resolve(sourcePath);
-			const existing = sourceDestinations.get(sourceKey);
-			if (existing) return existing;
-			const destination = reserveDestination(sourcePath);
-			if (sourceKey !== path.resolve(destination)) {
-				await fs.copyFile(sourcePath, destination);
-			}
-			sourceDestinations.set(sourceKey, destination);
-			copied.push(destination);
-			return destination;
+			return (await copyMedia(sourcePath, false)).destination;
 		},
-		async copyCursorSidecar(sourcePath, bundledMediaPath) {
-			const sidecar = `${sourcePath}.cursor.json`;
-			if (!(await isFile(sidecar))) return false;
-			const destination = `${bundledMediaPath}.cursor.json`;
-			if (destinationSet.has(destination)) return false;
-			destinationSet.add(destination);
-			if (path.resolve(sidecar) !== path.resolve(destination)) {
-				await fs.copyFile(sidecar, destination);
-			}
-			copied.push(destination);
-			return true;
+		async copyOriginal(sourcePath) {
+			return copyMedia(sourcePath, true);
 		},
 		files: () => [...copied],
 	};
@@ -120,7 +147,8 @@ export async function runPackCommand(
 	const loaded = await readProject(projectPath);
 	const projectDir = path.dirname(path.resolve(projectPath));
 	await fs.mkdir(outDir, { recursive: true });
-	const copier = createBundleCopier(outDir);
+	const packedProjectPath = path.join(outDir, path.basename(projectPath));
+	const copier = createBundleCopier(outDir, [packedProjectPath]);
 	let cursorSidecars = 0;
 	let assetCount = 1;
 	let droppedDerivedPaths = 0;
@@ -137,7 +165,8 @@ export async function runPackCommand(
 		if (!screenReference.resolvedPath) {
 			throw new Error(`Referenced media not found: ${screenVideoPath}`);
 		}
-		const newScreenPath = await copier.copy(screenReference.resolvedPath);
+		const bundledScreen = await copier.copyOriginal(screenReference.resolvedPath);
+		const newScreenPath = bundledScreen.destination;
 
 		let newWebcamPath: string | undefined;
 		if (media.webcamVideoPath) {
@@ -147,9 +176,7 @@ export async function runPackCommand(
 			}
 			newWebcamPath = await copier.copy(webcamReference.resolvedPath);
 		}
-		if (await copier.copyCursorSidecar(screenReference.resolvedPath, newScreenPath)) {
-			cursorSidecars++;
-		}
+		if (bundledScreen.cursorSidecarCopied) cursorSidecars++;
 
 		packedProject = {
 			...data,
@@ -162,34 +189,47 @@ export async function runPackCommand(
 		delete packedProject.videoPath;
 	} else {
 		assetCount = loaded.document.assets.length;
-		const assets = [];
+		const references = [];
 		for (const asset of loaded.document.assets) {
 			const originalReference = await resolveReference(projectDir, asset.originalPath);
 			if (!originalReference.resolvedPath) {
 				throw new Error(`Referenced media not found: ${asset.originalPath}`);
 			}
-			const bundledOriginal = await copier.copy(originalReference.resolvedPath);
-			if (await copier.copyCursorSidecar(originalReference.resolvedPath, bundledOriginal)) {
-				cursorSidecars++;
-			}
-
-			let cameraTrack = asset.cameraTrack;
-			if (cameraTrack) {
-				const cameraReference = await resolveReference(projectDir, cameraTrack.sourcePath);
+			let resolvedCameraPath: string | null = null;
+			if (asset.cameraTrack) {
+				const cameraReference = await resolveReference(projectDir, asset.cameraTrack.sourcePath);
 				if (!cameraReference.resolvedPath) {
-					throw new Error(`Referenced media not found: ${cameraTrack.sourcePath}`);
+					throw new Error(`Referenced media not found: ${asset.cameraTrack.sourcePath}`);
 				}
-				cameraTrack = {
-					...cameraTrack,
-					sourcePath: await copier.copy(cameraReference.resolvedPath),
-				};
+				resolvedCameraPath = cameraReference.resolvedPath;
 			}
+			references.push({ asset, originalPath: originalReference.resolvedPath, resolvedCameraPath });
+		}
+
+		// Originals reserve their optional cursor partner before cameras consume any names.
+		const originals = [];
+		for (const reference of references) {
+			const bundled = await copier.copyOriginal(reference.originalPath);
+			if (bundled.cursorSidecarCopied) cursorSidecars++;
+			originals.push(bundled.destination);
+		}
+
+		const assets = [];
+		for (const [index, reference] of references.entries()) {
+			const { asset } = reference;
+			const cameraTrack =
+				asset.cameraTrack && reference.resolvedCameraPath
+					? {
+							...asset.cameraTrack,
+							sourcePath: await copier.copy(reference.resolvedCameraPath),
+						}
+					: asset.cameraTrack;
 
 			const { proxyPath, waveformPath, ...portableAsset } = asset;
 			droppedDerivedPaths += Number(proxyPath !== undefined) + Number(waveformPath !== undefined);
 			assets.push({
 				...portableAsset,
-				originalPath: bundledOriginal,
+				originalPath: originals[index],
 				cameraTrack,
 			});
 		}
@@ -198,7 +238,6 @@ export async function runPackCommand(
 		packedProject = { ...loaded.document, assets };
 	}
 
-	const packedProjectPath = path.join(outDir, path.basename(projectPath));
 	await fs.writeFile(packedProjectPath, JSON.stringify(packedProject, null, 2), "utf8");
 	const copied = copier.files();
 
@@ -351,5 +390,9 @@ export async function runInfoCommand(
 		);
 		out(`${lines.join("\n")}\n`);
 	}
-	return assets.some((asset) => !asset.originalExists) ? 1 : 0;
+	return assets.some(
+		(asset) => !asset.originalExists || (asset.cameraPath !== null && !asset.cameraExists),
+	)
+		? 1
+		: 0;
 }

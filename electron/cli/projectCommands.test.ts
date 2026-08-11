@@ -213,6 +213,85 @@ describe("runPackCommand", () => {
 			droppedDerivedPaths: 2,
 		});
 	});
+
+	it("reserves the packed project filename before allocating media names", async () => {
+		const document = await currentProject();
+		const collidingMedia = await make("recordings/project/demo.openscreen", "video-bytes");
+		const withCollision = documentSchema.parse({
+			...document,
+			assets: [{ ...document.assets[0], originalPath: collidingMedia, cameraTrack: null }],
+			timeline: { ...document.timeline, clips: [document.timeline.clips[0]] },
+		});
+		const project = await writeCurrentProject("demo.openscreen", withCollision);
+		const outDir = path.join(root, "packed");
+
+		expect(await runPackCommand(project, outDir, true, recorder().write)).toBe(0);
+
+		const packed = await readCurrentProject(path.join(outDir, "demo.openscreen"));
+		expect(packed.assets[0].originalPath).toBe(path.join(outDir, "demo-1.openscreen"));
+		await expect(fs.readFile(packed.assets[0].originalPath, "utf8")).resolves.toBe("video-bytes");
+	});
+
+	it("treats case-only destination names as collisions on every platform", async () => {
+		const document = await currentProject();
+		const upper = await make("recordings/case-a/Clip.mp4", "upper");
+		const lower = await make("recordings/case-b/clip.mp4", "lower");
+		const caseDocument = documentSchema.parse({
+			...document,
+			assets: [
+				{ ...document.assets[0], originalPath: upper, cameraTrack: null },
+				{ ...document.assets[1], originalPath: lower },
+			],
+		});
+		const project = await writeCurrentProject("demo.openscreen", caseDocument);
+		const outDir = path.join(root, "packed");
+
+		expect(await runPackCommand(project, outDir, true, recorder().write)).toBe(0);
+
+		const packed = await readCurrentProject(path.join(outDir, "demo.openscreen"));
+		expect(packed.assets.map((asset) => path.basename(asset.originalPath))).toEqual([
+			"Clip.mp4",
+			"clip-1.mp4",
+		]);
+		await expect(fs.readFile(packed.assets[0].originalPath, "utf8")).resolves.toBe("upper");
+		await expect(fs.readFile(packed.assets[1].originalPath, "utf8")).resolves.toBe("lower");
+	});
+
+	it("allocates an original and its cursor sidecar as an atomic pair", async () => {
+		const document = await currentProject();
+		const sidecarNamedMedia = await make(
+			"recordings/collision/session.mp4.cursor.json",
+			"first-media",
+		);
+		await make("recordings/collision/session.mp4.cursor.json.cursor.json", "first-sidecar");
+		const laterMedia = await make("recordings/later/session.mp4", "second-media");
+		await make("recordings/later/session.mp4.cursor.json", "second-sidecar");
+		const collisionDocument = documentSchema.parse({
+			...document,
+			assets: [
+				{ ...document.assets[0], originalPath: sidecarNamedMedia, cameraTrack: null },
+				{ ...document.assets[1], originalPath: laterMedia },
+			],
+		});
+		const project = await writeCurrentProject("demo.openscreen", collisionDocument);
+		const outDir = path.join(root, "packed");
+
+		expect(await runPackCommand(project, outDir, true, recorder().write)).toBe(0);
+
+		const packed = await readCurrentProject(path.join(outDir, "demo.openscreen"));
+		expect(packed.assets.map((asset) => path.basename(asset.originalPath))).toEqual([
+			"session.mp4.cursor.json",
+			"session-1.mp4",
+		]);
+		await expect(fs.readFile(packed.assets[0].originalPath, "utf8")).resolves.toBe("first-media");
+		await expect(fs.readFile(`${packed.assets[0].originalPath}.cursor.json`, "utf8")).resolves.toBe(
+			"first-sidecar",
+		);
+		await expect(fs.readFile(packed.assets[1].originalPath, "utf8")).resolves.toBe("second-media");
+		await expect(fs.readFile(`${packed.assets[1].originalPath}.cursor.json`, "utf8")).resolves.toBe(
+			"second-sidecar",
+		);
+	});
 });
 
 describe("runInfoCommand", () => {
@@ -294,6 +373,19 @@ describe("runInfoCommand", () => {
 		const out = recorder();
 		expect(await runInfoCommand(project, false, out.write)).toBe(1);
 		expect(out.text()).toContain("Screen B");
+		expect(out.text()).toContain("[MISSING]");
+	});
+
+	it("exits 1 when a current-schema camera track is missing", async () => {
+		const document = await currentProject();
+		const cameraPath = document.assets[0].cameraTrack?.sourcePath;
+		expect(cameraPath).toBeTruthy();
+		await fs.rm(cameraPath ?? "");
+		const project = await writeCurrentProject("demo.openscreen", document);
+
+		const out = recorder();
+		expect(await runInfoCommand(project, false, out.write)).toBe(1);
+		expect(out.text()).toContain("Camera:");
 		expect(out.text()).toContain("[MISSING]");
 	});
 });

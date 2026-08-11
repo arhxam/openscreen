@@ -7,7 +7,7 @@ type FakeWindow = EditorMenuWindow & {
 };
 
 function createWindow(
-	options: { editor?: boolean; destroyed?: boolean; loading?: boolean } = {},
+	options: { editor?: boolean; destroyed?: boolean; loading?: boolean; url?: string } = {},
 ): FakeWindow {
 	const send = vi.fn();
 	let loading = options.loading ?? false;
@@ -17,9 +17,10 @@ function createWindow(
 		isDestroyed: () => options.destroyed ?? false,
 		webContents: {
 			getURL: () =>
-				options.editor === false
+				options.url ??
+				(options.editor === false
 					? "file:///index.html?windowType=notes"
-					: "file:///index.html?windowType=editor",
+					: "file:///index.html?windowType=editor"),
 			isLoadingMainFrame: () => loading,
 			send,
 			once: (event, listener) => {
@@ -124,9 +125,13 @@ describe("dispatchEditorMenuAction", () => {
 		expect(replacement.send).not.toHaveBeenCalled();
 	});
 
-	it("delivers two rapid actions after a newly created editor finishes loading", () => {
-		const created = createWindow({ loading: true });
-		const createEditor = vi.fn(() => created);
+	it("retains a newly created about:blank editor for rapid actions", () => {
+		const created = createWindow({ loading: true, url: "about:blank" });
+		const replacement = createWindow({ loading: true, url: "about:blank" });
+		const createEditor = vi
+			.fn<() => EditorMenuWindow>()
+			.mockReturnValueOnce(created)
+			.mockReturnValueOnce(replacement);
 
 		dispatchEditorMenuAction("menu-load-project", null, null, createEditor);
 		dispatchEditorMenuAction("menu-save-project", null, created, createEditor);
@@ -134,10 +139,8 @@ describe("dispatchEditorMenuAction", () => {
 		expect(createEditor).toHaveBeenCalledOnce();
 		expect(created.send).not.toHaveBeenCalled();
 		created.emitDidFinishLoad();
-		expect(created.send.mock.calls).toEqual([
-			["menu-load-project"],
-			["menu-save-project"],
-		]);
+		expect(created.send.mock.calls).toEqual([["menu-load-project"], ["menu-save-project"]]);
+		expect(replacement.send).not.toHaveBeenCalled();
 	});
 
 	it("does not send after a newly created target is destroyed", () => {

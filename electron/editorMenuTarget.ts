@@ -14,12 +14,15 @@ export interface EditorMenuWindow {
 	};
 }
 
+const knownEditorWindows = new WeakSet<EditorMenuWindow>();
+
 function isLiveEditorWindow(window: EditorMenuWindow | null): window is EditorMenuWindow {
-	return (
-		window !== null &&
-		!window.isDestroyed() &&
-		window.webContents.getURL().includes("windowType=editor")
-	);
+	if (!window || window.isDestroyed()) return false;
+	if (knownEditorWindows.has(window)) return true;
+	if (!window.webContents.getURL().includes("windowType=editor")) return false;
+
+	knownEditorWindows.add(window);
+	return true;
 }
 
 function sendWhenReady(window: EditorMenuWindow, channel: EditorMenuChannel) {
@@ -56,5 +59,6 @@ export function dispatchEditorMenuAction(
 	const createdEditor = createEditorWindow();
 	if (!createdEditor) return;
 
+	knownEditorWindows.add(createdEditor);
 	sendWhenReady(createdEditor, channel);
 }

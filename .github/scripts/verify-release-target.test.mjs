@@ -48,6 +48,15 @@ test("peels an annotated tag before comparing it with the workflow commit", () =
 	assert.equal(verifyReleaseTarget("v1.9.2", sha, repository), sha);
 });
 
+test("accepts an annotated tag object's SHA as the workflow revision", () => {
+	const sha = commit("annotated workflow revision");
+	git("tag", "-a", "v1.9.2", "-m", "release v1.9.2");
+	const tagObjectSha = git("rev-parse", "refs/tags/v1.9.2");
+
+	assert.notEqual(tagObjectSha, sha);
+	assert.equal(verifyReleaseTarget("v1.9.2", tagObjectSha, repository), sha);
+});
+
 test("runs directly the way the release workflow invokes it", () => {
 	const sha = commit("direct invocation target");
 	git("tag", "v1.9.2");

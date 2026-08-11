@@ -15,6 +15,7 @@ import { ShortcutBinding } from "../src/lib/shortcuts";
 import { parseCliArgs } from "./cli/args";
 import { runCli } from "./cli/cliMain";
 import { isDiagnosticModeEnabled, mainLogBuffer } from "./diagnostics/main-log-buffer";
+import { dispatchEditorMenuAction, type EditorMenuChannel } from "./editorMenuTarget";
 import {
 	loadAndRegisterGlobalShortcut,
 	registerOpenAppShortcut,
@@ -145,28 +146,13 @@ if (cliCommand) {
 	app.quit();
 }
 
-function isEditorWindow(window: BrowserWindow) {
-	return window.webContents.getURL().includes("windowType=editor");
-}
-
-function sendEditorMenuAction(
-	channel: "menu-load-project" | "menu-save-project" | "menu-save-project-as" | "menu-new-project",
-) {
-	let targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
-
-	if (!targetWindow || targetWindow.isDestroyed() || !isEditorWindow(targetWindow)) {
-		createEditorWindowWrapper();
-		targetWindow = mainWindow;
-		if (!targetWindow || targetWindow.isDestroyed()) return;
-
-		targetWindow.webContents.once("did-finish-load", () => {
-			if (!targetWindow || targetWindow.isDestroyed()) return;
-			targetWindow.webContents.send(channel);
-		});
-		return;
-	}
-
-	targetWindow.webContents.send(channel);
+function sendEditorMenuAction(channel: EditorMenuChannel) {
+	dispatchEditorMenuAction(
+		channel,
+		BrowserWindow.getFocusedWindow(),
+		mainWindow,
+		createEditorWindowWrapper,
+	);
 }
 
 function setupApplicationMenu() {
@@ -448,6 +434,8 @@ function createEditorWindowWrapper() {
 			// "cancel": flag reset, window stays open
 		});
 	});
+
+	return mainWindow;
 }
 
 function createSourceSelectorWindowWrapper() {
